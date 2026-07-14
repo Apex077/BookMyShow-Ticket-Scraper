@@ -1,0 +1,15 @@
+beautifulsoup4==4.15.0
+certifi==2026.5.20
+cffi==2.0.0
+charset-normalizer==3.4.7
+curl_cffi==0.15.0
+idna==3.18
+markdown-it-py==4.2.0
+mdurl==0.1.2
+pycparser==3.0
+Pygments==2.20.0
+requests==2.34.2
+rich==15.0.0
+soupsieve==2.8.4
+typing_extensions==4.15.0
+urllib3==2.7.0

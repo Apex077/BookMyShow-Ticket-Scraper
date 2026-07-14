@@ -10,7 +10,7 @@ It uses browser impersonation (via `curl-cffi`) to bypass Cloudflare anti-bot bl
 
 ---
 
-## Security First 🔒
+## Security First
 To protect your email credentials and application passwords from leaking into shell history, process listings (`ps aux`), or plaintext systemd unit files, this project uses a `.env` file for configuration.
 
 ---
