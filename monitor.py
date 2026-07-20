@@ -8,6 +8,7 @@ import time
 import subprocess
 import random
 from datetime import datetime
+from collections import Counter
 from curl_cffi import requests
 from bs4 import BeautifulSoup
 
@@ -166,45 +167,117 @@ def trigger_notifications(found_dates, movie_name, city, args):
         except Exception as e:
             console.log(f"[yellow]Warning: Failed to send push notification to ntfy.sh: {e}[/yellow]")
 
-def check_bookings(movie_id, movie_name, city, target_dates):
+def fetch_page(session, url, retries=3, backoff_factor=3):
     """
-    Scrapes the showtimes page and checks if any target dates are active/open.
+    Fetches the page content with retries and exponential backoff.
+    Re-creates the session object on 403 errors or network drops.
     """
-    # We query the URL for one of the target dates.
-    # If not open, BookMyShow falls back to the earliest available date.
-    test_date = target_dates[0]
-    url = f"https://in.bookmyshow.com/movies/{city}/{movie_name}/buytickets/{movie_id}/{test_date}"
+    current_session = session
+    for attempt in range(retries):
+        try:
+            # We omit custom headers to let curl_cffi use default matching browser headers
+            r = current_session.get(url, impersonate="chrome", timeout=15)
+            
+            if r.status_code == 200:
+                if "Just a moment..." in r.text or "Turnstile" in r.text:
+                    console.log(f"[yellow]Cloudflare challenge page detected (attempt {attempt + 1}/{retries}). Re-creating session...[/yellow]")
+                    current_session.close()
+                    current_session = requests.Session()
+                    time.sleep(backoff_factor * (2 ** attempt))
+                    continue
+                return r.text, current_session, None
+                
+            elif r.status_code == 403:
+                console.log(f"[yellow]HTTP 403 Forbidden (attempt {attempt + 1}/{retries}). Re-creating session...[/yellow]")
+                current_session.close()
+                current_session = requests.Session()
+                time.sleep(backoff_factor * (2 ** attempt))
+                
+            else:
+                return None, current_session, f"HTTP Error {r.status_code}"
+                
+        except Exception as e:
+            console.log(f"[yellow]Request exception (attempt {attempt + 1}/{retries}): {e}. Re-creating session...[/yellow]")
+            current_session.close()
+            current_session = requests.Session()
+            time.sleep(backoff_factor * (2 ** attempt))
+            
+    return None, current_session, "Max retries exceeded (Cloudflare or network block)"
+
+def check_bookings(session, movie_id, movie_name, city, target_dates, venue_codes=None, min_references=10):
+    """
+    Scrapes the showtimes page and checks if any target dates are active/open and bookable.
+    """
+    found_dates = []
+    carousel_dates = []
+    updated_session = session
     
-    headers = {
-        "User-Agent": random.choice(USER_AGENTS),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Referer": "https://in.bookmyshow.com/",
-    }
-    
-    try:
-        # We impersonate chrome to match TLS signature and bypass Cloudflare 403s
-        r = requests.get(url, headers=headers, impersonate="chrome", timeout=15)
+    for target_date in target_dates:
+        url = f"https://in.bookmyshow.com/movies/{city}/{movie_name}/buytickets/{movie_id}/{target_date}"
         
-        if r.status_code != 200:
-            return False, [], [], f"HTTP Error {r.status_code}"
+        html, updated_session, error_msg = fetch_page(updated_session, url)
+        if error_msg:
+            return False, [], [], error_msg, updated_session
+            
+        soup = BeautifulSoup(html, 'html.parser')
         
-        soup = BeautifulSoup(r.text, 'html.parser')
-        
-        # 1. Parse dates from the carousel divs (id is YYYYMMDD)
-        carousel_dates = []
+        # 1. Parse all dates in the carousel for logging/reporting
         date_divs = soup.find_all(lambda tag: tag.name == 'div' and tag.get('id') and re.match(r'^\d{8}$', tag.get('id')))
         for div in date_divs:
-            carousel_dates.append(div.get('id'))
+            d_id = div.get('id')
+            if d_id not in carousel_dates:
+                carousel_dates.append(d_id)
+                
+        # 2. Find which date is selected in the carousel (DayName class == MonthName class)
+        selected_date = None
+        for div in date_divs:
+            children = div.find_all('div')
+            if len(children) >= 3:
+                day_name_class = children[0].get('class', [])
+                month_name_class = children[2].get('class', [])
+                if day_name_class == month_name_class:
+                    selected_date = div.get('id')
+                    break
+                    
+        # 3. Find if there are active showtimes on the page
+        showtime_pattern = re.compile(r'\b\d{2}:\d{2}\s*(?:AM|PM)\b')
+        showtime_nodes = soup.find_all(string=showtime_pattern)
+        has_showtimes = len(showtime_nodes) > 0
+        
+        # Primary check: Target date is selected in the carousel and has active showtimes
+        primary_open = (selected_date == target_date) and has_showtimes
+        
+        # Fallback checks (inspired by Movie-Alert)
+        fallback_open = False
+        fallback_reasons = []
+        
+        if not primary_open:
+            # A. Venue-Date Fallback: check if target venue codes are listed for target_date
+            if venue_codes:
+                for code in venue_codes:
+                    pattern = f"/{code}/{target_date}"
+                    if pattern in html:
+                        fallback_open = True
+                        fallback_reasons.append(f"Venue link found for {code}")
+                        break
             
-        # 2. Check if any target date is in the carousel
-        found_dates = [d for d in target_dates if d in carousel_dates]
+            # B. BMS-Date Fallback: count date tokens on the page
+            tokens = re.findall(r"\b20\d{6}\b", html)
+            if tokens:
+                counts = Counter(tokens)
+                top_date = counts.most_common(1)[0][0]
+                requested_count = counts.get(target_date, 0)
+                if top_date == target_date and requested_count >= min_references:
+                    fallback_open = True
+                    fallback_reasons.append(f"Dominant date token ({requested_count} refs)")
         
-        return True, found_dates, carousel_dates, None
-        
-    except Exception as e:
-        return False, [], [], str(e)
+        if primary_open or fallback_open:
+            reason_str = "primary check" if primary_open else f"fallback check ({', '.join(fallback_reasons)})"
+            console.log(f"[green]Date {target_date} detected open via {reason_str}[/green]")
+            found_dates.append(target_date)
+            
+    carousel_dates.sort()
+    return True, found_dates, carousel_dates, None, updated_session
 
 def install_systemd_service(args):
     """Helper to install the monitor as a systemd user service using EnvironmentFile for security."""
@@ -221,7 +294,7 @@ def install_systemd_service(args):
         console.print(f"[yellow]Warning: No .env file found at {env_file}. Creating a template for you.[/yellow]")
         with open(env_file, "w") as f:
             f.write(f"""# BookMyShow Monitor Configuration
-
+ 
 # Target Movie & City settings
 BMS_MOVIE_ID={args.movie_id}
 BMS_MOVIE_NAME={args.movie_name}
@@ -229,9 +302,13 @@ BMS_CITY={args.city}
 BMS_DATES={",".join(args.dates)}
 BMS_INTERVAL={args.interval}
 
+# Fallback Detectors settings (optional)
+BMS_VENUE_CODES={",".join(args.venue_codes) if args.venue_codes else ""}
+BMS_MIN_REFERENCES={args.min_references}
+ 
 # Mobile Push Alerts (ntfy.sh)
 BMS_NTFY_TOPIC={args.ntfy_topic or "your-custom-ntfy-topic"}
-
+ 
 # Email Notifications (SMTP)
 BMS_EMAIL_SENDER={args.email_sender or "your-email@gmail.com"}
 BMS_EMAIL_PASSWORD={args.email_password or "your-app-password"}
@@ -293,6 +370,7 @@ def run_monitor(args):
         border_style="green"
     ))
     
+    session = requests.Session()
     consecutive_errors = 0
     check_count = 0
     
@@ -300,8 +378,9 @@ def run_monitor(args):
         check_count += 1
         console.log(f"Check #{check_count}: Contacting BookMyShow...")
         
-        success, found_dates, carousel_dates, error_msg = check_bookings(
-            args.movie_id, args.movie_name, args.city, args.dates
+        success, found_dates, carousel_dates, error_msg, session = check_bookings(
+            session, args.movie_id, args.movie_name, args.city, args.dates,
+            venue_codes=args.venue_codes, min_references=args.min_references
         )
         
         if success:
@@ -370,6 +449,8 @@ if __name__ == "__main__":
     parser.add_argument("--email-recipient", default=os.environ.get("BMS_EMAIL_RECIPIENT"), help="Recipient email address (defaults to sender email)")
     parser.add_argument("--email-smtp-server", default=os.environ.get("BMS_EMAIL_SMTP_SERVER", "smtp.gmail.com"), help="SMTP server (default: smtp.gmail.com)")
     parser.add_argument("--email-smtp-port", type=int, default=int(os.environ.get("BMS_EMAIL_SMTP_PORT", 587)), help="SMTP port (default: 587)")
+    parser.add_argument("--venue-codes", default=os.environ.get("BMS_VENUE_CODES"), help="Comma-separated venue codes for fallback check (e.g. INPR,PVPZ)")
+    parser.add_argument("--min-references", type=int, default=int(os.environ.get("BMS_MIN_REFERENCES", 10)), help="Min page references count for fallback bms_date check (default: 10)")
     parser.add_argument("--test-notify", action="store_true", help="Send test notifications and exit")
     parser.add_argument("--install-service", action="store_true", help="Generate and install Systemd user service")
     
@@ -380,6 +461,10 @@ if __name__ == "__main__":
     if not args.dates:
         print("Error: No valid target dates provided. Dates must be in YYYYMMDD format.")
         sys.exit(1)
+        
+    # Process venue codes
+    if args.venue_codes:
+        args.venue_codes = [c.strip() for c in args.venue_codes.split(",") if c.strip()]
         
     if args.install_service:
         install_systemd_service(args)
