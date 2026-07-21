@@ -49,7 +49,6 @@ except ImportError:
 # Fallback print functions if rich is not present
 class MockConsole:
     def print(self, *args, **kwargs):
-        # Strip rich-style markup if printing normally
         text = " ".join(str(a) for a in args)
         text = re.sub(r'\[/?\w+.*?\]', '', text)
         print(text, **kwargs)
@@ -60,7 +59,6 @@ if not HAS_RICH:
     console = MockConsole()
 
 DEFAULT_MOVIE_ID = "ET00480917"
-DEFAULT_MOVIE_NAME = "the-odyssey"
 DEFAULT_CITY = "chennai"
 DEFAULT_DATES = ["20260725", "20260726"]
 DEFAULT_INTERVAL = 300  # 5 minutes
@@ -80,11 +78,83 @@ def format_date_human(date_str):
     except ValueError:
         return date_str
 
-def trigger_notifications(found_dates, movie_name, city, args):
+def extract_movie_info_from_html(html):
+    """Extracts movie title and derived URL slug from HTML content."""
+    if not html:
+        return None, None
+    soup = BeautifulSoup(html, 'html.parser')
+    
+    movie_title = None
+    if soup.title and soup.title.string:
+        title_text = soup.title.string.strip()
+        m = re.match(r'^(.*?)\s+Movie Showtimes in', title_text, re.IGNORECASE)
+        if m and m.group(1).strip():
+            movie_title = m.group(1).strip()
+        else:
+            m = re.match(r'^(.*?)\s+Movie Tickets', title_text, re.IGNORECASE)
+            if m and m.group(1).strip():
+                movie_title = m.group(1).strip()
+            else:
+                m = re.match(r'^(.*?)\s*\(\d{4}\)', title_text)
+                if m and m.group(1).strip():
+                    movie_title = m.group(1).strip()
+
+    if not movie_title:
+        meta_desc = soup.find('meta', attrs={'name': 'description'})
+        if meta_desc and meta_desc.get('content'):
+            m = re.search(r'film\s+([^,]+?)\s+with release date', meta_desc['content'], re.IGNORECASE)
+            if m:
+                movie_title = m.group(1).strip()
+                
+    if movie_title:
+        movie_title = movie_title.strip()
+        slug = re.sub(r'[^a-zA-Z0-9]+', '-', movie_title.lower()).strip('-')
+        return movie_title, slug
+        
+    return None, None
+
+def is_venue_code_present(code, html):
+    """Checks if a venue code appears in the page HTML."""
+    if not code or not html:
+        return False
+    code_upper = code.upper()
+    code_lower = code.lower()
+    patterns = [
+        rf'/{code_upper}\b',
+        rf'/{code_lower}\b',
+        rf'cinema-[^/]+-{code_upper}',
+        rf'cinemas/[^/]+/[^/]+/{code_upper}\b',
+        rf'\b{code_upper}\b'
+    ]
+    for p in patterns:
+        if re.search(p, html):
+            return True
+    return False
+
+def resolve_movie_title(session, movie_id, city, movie_name=None, target_date=None):
+    """
+    Fetches BookMyShow buytickets page for the given movie_id and extracts the human-readable movie title.
+    Returns (resolved_title, resolved_slug, updated_session).
+    """
+    slug = movie_name or "placeholder"
+    date_str = target_date or ""
+    url = f"https://in.bookmyshow.com/movies/{city}/{slug}/buytickets/{movie_id}/{date_str}".rstrip('/')
+    
+    html, updated_session, error_msg = fetch_page(session, url)
+    if html:
+        title, slug_derived = extract_movie_info_from_html(html)
+        if title:
+            return title, slug_derived, updated_session
+            
+    fallback_title = movie_name.replace('-', ' ').title() if movie_name else movie_id
+    fallback_slug = movie_name if movie_name else "placeholder"
+    return fallback_title, fallback_slug, updated_session
+
+def trigger_notifications(found_dates, movie_title, movie_slug, city, args):
     """Triggers all configured alert notifications."""
     date_strs = ", ".join(format_date_human(d) for d in found_dates)
     title = "🎟️ Tickets Open Alert!"
-    message = f"Bookings for '{movie_name.replace('-', ' ').title()}' in {city.title()} are now OPEN for: {date_strs}!"
+    message = f"Bookings for '{movie_title}' in {city.title()} are now OPEN for: {date_strs}!"
     
     # 1. Desktop Notification (notify-send)
     try:
@@ -111,10 +181,9 @@ def trigger_notifications(found_dates, movie_name, city, args):
             msg['To'] = recipient
             msg['Subject'] = title
             
-            body = f"Hello,\n\n{message}\n\nCheck showtimes here:\nhttps://in.bookmyshow.com/movies/{city}/{movie_name}/buytickets/{args.movie_id}/{found_dates[0]}\n\nRegards,\nBMS Monitor Script"
+            body = f"Hello,\n\n{message}\n\nCheck showtimes here:\nhttps://in.bookmyshow.com/movies/{city}/{movie_slug}/buytickets/{args.movie_id}/{found_dates[0]}\n\nRegards,\nBMS Monitor Script"
             msg.attach(MIMEText(body, 'plain'))
             
-            # Connect to SMTP server
             if args.email_smtp_port == 465:
                 server = smtplib.SMTP_SSL(args.email_smtp_server, args.email_smtp_port, timeout=15)
             else:
@@ -151,7 +220,6 @@ def trigger_notifications(found_dates, movie_name, city, args):
     if hasattr(args, 'ntfy_topic') and args.ntfy_topic:
         try:
             ntfy_url = f"https://ntfy.sh/{args.ntfy_topic}"
-            # Strip emojis or non-ascii from Title for header compatibility
             safe_title = title.encode('ascii', 'ignore').decode('ascii').strip()
             requests.post(
                 ntfy_url,
@@ -175,7 +243,6 @@ def fetch_page(session, url, retries=3, backoff_factor=3):
     current_session = session
     for attempt in range(retries):
         try:
-            # We omit custom headers to let curl_cffi use default matching browser headers
             r = current_session.get(url, impersonate="chrome", timeout=15)
             
             if r.status_code == 200:
@@ -204,21 +271,32 @@ def fetch_page(session, url, retries=3, backoff_factor=3):
             
     return None, current_session, "Max retries exceeded (Cloudflare or network block)"
 
-def check_bookings(session, movie_id, movie_name, city, target_dates, venue_codes=None, min_references=10):
+def check_bookings(session, movie_id, movie_slug, city, target_dates, venue_codes=None, min_references=10):
     """
     Scrapes the showtimes page and checks if any target dates are active/open and bookable.
+    Returns: (success, found_dates, carousel_dates, resolved_title, resolved_slug, error_msg, updated_session)
     """
     found_dates = []
     carousel_dates = []
     updated_session = session
+    resolved_title = None
+    resolved_slug = None
+    
+    slug_to_use = movie_slug or "placeholder"
     
     for target_date in target_dates:
-        url = f"https://in.bookmyshow.com/movies/{city}/{movie_name}/buytickets/{movie_id}/{target_date}"
+        url = f"https://in.bookmyshow.com/movies/{city}/{slug_to_use}/buytickets/{movie_id}/{target_date}"
         
         html, updated_session, error_msg = fetch_page(updated_session, url)
         if error_msg:
-            return False, [], [], error_msg, updated_session
+            return False, [], [], None, None, error_msg, updated_session
             
+        if not resolved_title:
+            extracted_title, extracted_slug = extract_movie_info_from_html(html)
+            if extracted_title:
+                resolved_title = extracted_title
+                resolved_slug = extracted_slug
+                
         soup = BeautifulSoup(html, 'html.parser')
         
         # 1. Parse all dates in the carousel for logging/reporting
@@ -244,10 +322,18 @@ def check_bookings(session, movie_id, movie_name, city, target_dates, venue_code
         showtime_nodes = soup.find_all(string=showtime_pattern)
         has_showtimes = len(showtime_nodes) > 0
         
-        # Primary check: Target date is selected in the carousel and has active showtimes
-        primary_open = (selected_date == target_date) and has_showtimes
+        # Check venue condition if venue_codes filter was specified by user
+        matching_venues = []
+        if venue_codes:
+            matching_venues = [code for code in venue_codes if is_venue_code_present(code, html)]
+            venue_matched = len(matching_venues) > 0
+        else:
+            venue_matched = True
+            
+        # Primary check: Target date is selected in carousel, showtimes are active, and target venue matches (if specified)
+        primary_open = (selected_date == target_date) and has_showtimes and venue_matched
         
-        # Fallback checks (inspired by Movie-Alert)
+        # Fallback checks
         fallback_open = False
         fallback_reasons = []
         
@@ -256,28 +342,36 @@ def check_bookings(session, movie_id, movie_name, city, target_dates, venue_code
             if venue_codes:
                 for code in venue_codes:
                     pattern = f"/{code}/{target_date}"
-                    if pattern in html:
+                    if pattern in html or is_venue_code_present(code, html):
                         fallback_open = True
                         fallback_reasons.append(f"Venue link found for {code}")
                         break
             
-            # B. BMS-Date Fallback: count date tokens on the page
-            tokens = re.findall(r"\b20\d{6}\b", html)
-            if tokens:
-                counts = Counter(tokens)
-                top_date = counts.most_common(1)[0][0]
-                requested_count = counts.get(target_date, 0)
-                if top_date == target_date and requested_count >= min_references:
-                    fallback_open = True
-                    fallback_reasons.append(f"Dominant date token ({requested_count} refs)")
+            # B. BMS-Date Fallback: count date tokens on the page (only if no venue code restriction or venue matched)
+            if not venue_codes or venue_matched:
+                tokens = re.findall(r"\b20\d{6}\b", html)
+                if tokens:
+                    counts = Counter(tokens)
+                    top_date = counts.most_common(1)[0][0]
+                    requested_count = counts.get(target_date, 0)
+                    if top_date == target_date and requested_count >= min_references:
+                        fallback_open = True
+                        fallback_reasons.append(f"Dominant date token ({requested_count} refs)")
         
         if primary_open or fallback_open:
-            reason_str = "primary check" if primary_open else f"fallback check ({', '.join(fallback_reasons)})"
+            if primary_open:
+                venue_info = f" (venues: {', '.join(matching_venues)})" if matching_venues else ""
+                reason_str = f"primary check{venue_info}"
+            else:
+                reason_str = f"fallback check ({', '.join(fallback_reasons)})"
+                
             console.log(f"[green]Date {target_date} detected open via {reason_str}[/green]")
             found_dates.append(target_date)
+        elif selected_date == target_date and has_showtimes and venue_codes and not venue_matched:
+            console.log(f"[yellow]Showtimes active on {target_date}, but none of specified venue codes ({', '.join(venue_codes)}) were found on page.[/yellow]")
             
     carousel_dates.sort()
-    return True, found_dates, carousel_dates, None, updated_session
+    return True, found_dates, carousel_dates, resolved_title, resolved_slug, None, updated_session
 
 def install_systemd_service(args):
     """Helper to install the monitor as a systemd user service using EnvironmentFile for security."""
@@ -289,7 +383,6 @@ def install_systemd_service(args):
     project_dir = os.path.dirname(script_path)
     env_file = os.path.join(project_dir, ".env")
     
-    # Check if .env exists, if not write a template
     if not os.path.exists(env_file):
         console.print(f"[yellow]Warning: No .env file found at {env_file}. Creating a template for you.[/yellow]")
         with open(env_file, "w") as f:
@@ -297,7 +390,7 @@ def install_systemd_service(args):
  
 # Target Movie & City settings
 BMS_MOVIE_ID={args.movie_id}
-BMS_MOVIE_NAME={args.movie_name}
+BMS_MOVIE_NAME={args.movie_name or ""}
 BMS_CITY={args.city}
 BMS_DATES={",".join(args.dates)}
 BMS_INTERVAL={args.interval}
@@ -349,10 +442,20 @@ WantedBy=default.target
 
 def run_monitor(args):
     """Main monitoring loop."""
+    session = requests.Session()
+    
+    console.log(f"Resolving movie title for ID [bold cyan]{args.movie_id}[/bold cyan]...")
+    resolved_title, resolved_slug, session = resolve_movie_title(
+        session, args.movie_id, args.city, movie_name=args.movie_name, target_date=args.dates[0]
+    )
+    
+    movie_title = resolved_title or (args.movie_name or args.movie_id).replace('-', ' ').title()
+    movie_slug = resolved_slug or args.movie_name or "placeholder"
+
     # Test notifications if requested
     if args.test_notify:
         console.print("[cyan]Testing notifications...[/cyan]")
-        trigger_notifications(args.dates[:1], args.movie_name, args.city, args)
+        trigger_notifications(args.dates[:1], movie_title, movie_slug, args.city, args)
         console.print("[green]Test notifications completed successfully.[/green]")
         return
 
@@ -360,9 +463,10 @@ def run_monitor(args):
     console.print(Panel(
         Align.center(
             f"[bold green]🎫 BookMyShow Ticket Monitor Running[/bold green]\n"
-            f"[bold white]Movie:[/] {args.movie_name.replace('-', ' ').title()} ({args.movie_id})\n"
+            f"[bold white]Movie:[/] [bold yellow]{movie_title}[/bold yellow] ({args.movie_id})\n"
             f"[bold white]City:[/] {args.city.title()} | [bold white]Interval:[/] {args.interval}s\n"
             f"[bold white]Watching Dates:[/] {', '.join(format_date_human(d) for d in args.dates)}\n"
+            + (f"[bold white]Venue Filter:[/] {', '.join(args.venue_codes)}\n" if args.venue_codes else "[bold white]Venue Filter:[/] All Venues\n")
             + (f"[bold white]Mobile Alerts:[/] ntfy.sh/{args.ntfy_topic}\n" if args.ntfy_topic else "")
             + (f"[bold white]Email Alerts:[/] {args.email_recipient or args.email_sender}\n" if args.email_sender else "")
         ),
@@ -370,7 +474,6 @@ def run_monitor(args):
         border_style="green"
     ))
     
-    session = requests.Session()
     consecutive_errors = 0
     check_count = 0
     
@@ -378,10 +481,14 @@ def run_monitor(args):
         check_count += 1
         console.log(f"Check #{check_count}: Contacting BookMyShow...")
         
-        success, found_dates, carousel_dates, error_msg, session = check_bookings(
-            session, args.movie_id, args.movie_name, args.city, args.dates,
+        success, found_dates, carousel_dates, new_title, new_slug, error_msg, session = check_bookings(
+            session, args.movie_id, movie_slug, args.city, args.dates,
             venue_codes=args.venue_codes, min_references=args.min_references
         )
+        
+        if new_title and new_title != movie_title:
+            movie_title = new_title
+            movie_slug = new_slug
         
         if success:
             consecutive_errors = 0
@@ -389,47 +496,37 @@ def run_monitor(args):
             console.log(f"[green]Success.[/green] Currently open dates: {', '.join(human_carousel)}")
             
             if found_dates:
-                console.log(f"[bold red]💥 TARGET BOOKINGS OPEN FOR: {', '.join(found_dates)}!!![/bold red]")
-                # Alert!
-                trigger_notifications(found_dates, args.movie_name, args.city, args)
-                
-                # Stop monitoring or let it run to avoid missing others?
-                # Usually we want to keep running to notify or stop once we notify successfully.
+                console.log(f"[bold red]💥 TARGET BOOKINGS OPEN FOR '{movie_title}': {', '.join(found_dates)}!!![/bold red]")
+                trigger_notifications(found_dates, movie_title, movie_slug, args.city, args)
                 console.log("[green]Alert sent successfully. Keeping the monitor active for any updates.[/green]")
             else:
-                console.log("[cyan]Target dates not yet open.[/cyan]")
+                console.log("[cyan]Target dates not yet open for specified criteria.[/cyan]")
         else:
             consecutive_errors += 1
             console.log(f"[red]Error checking BookMyShow: {error_msg}[/red]")
             
             if consecutive_errors >= 5:
-                # Notify the user that the script is failing repeatedly (e.g. rate limit, internet down)
                 subprocess.run([
                     "notify-send", 
                     "⚠️ Ticket Monitor Error", 
                     f"BMS Monitor has failed {consecutive_errors} times consecutively. Error: {error_msg}", 
                     "--urgency=normal"
                 ], check=False)
-                consecutive_errors = 0 # Reset count to avoid spamming alerts about errors
+                consecutive_errors = 0
                 
-        # Sleep with countdown panel
         sleep_start = time.time()
         next_check_time = sleep_start + args.interval
         
-        # Countdown loop
         while time.time() < next_check_time:
             remaining = int(next_check_time - time.time())
             if remaining <= 0:
                 break
             
-            # Update terminal progress/countdown if rich is installed
             if HAS_RICH and sys.stdout.isatty():
-                # Print a small countdown text that updates in-place
                 sys.stdout.write(f"\rNext check in {remaining:02d}s... ")
                 sys.stdout.flush()
                 time.sleep(1)
             else:
-                # If running as systemd service, just sleep the full interval
                 time.sleep(min(remaining, 10))
                 
         if HAS_RICH and sys.stdout.isatty():
@@ -439,7 +536,7 @@ def run_monitor(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Monitor BookMyShow showtimes for specific dates.")
     parser.add_argument("--movie-id", default=os.environ.get("BMS_MOVIE_ID", DEFAULT_MOVIE_ID), help="BMS movie ID (from URL)")
-    parser.add_argument("--movie-name", default=os.environ.get("BMS_MOVIE_NAME", DEFAULT_MOVIE_NAME), help="BMS movie URL slug")
+    parser.add_argument("--movie-name", default=os.environ.get("BMS_MOVIE_NAME"), help="BMS movie URL slug (optional, auto-resolved from movie-id if omitted)")
     parser.add_argument("--city", default=os.environ.get("BMS_CITY", DEFAULT_CITY), help="City name in BMS URL")
     parser.add_argument("--dates", default=os.environ.get("BMS_DATES", ",".join(DEFAULT_DATES)), help="Comma-separated target dates (YYYYMMDD)")
     parser.add_argument("--interval", type=int, default=int(os.environ.get("BMS_INTERVAL", DEFAULT_INTERVAL)), help="Monitoring interval in seconds")
@@ -449,22 +546,20 @@ if __name__ == "__main__":
     parser.add_argument("--email-recipient", default=os.environ.get("BMS_EMAIL_RECIPIENT"), help="Recipient email address (defaults to sender email)")
     parser.add_argument("--email-smtp-server", default=os.environ.get("BMS_EMAIL_SMTP_SERVER", "smtp.gmail.com"), help="SMTP server (default: smtp.gmail.com)")
     parser.add_argument("--email-smtp-port", type=int, default=int(os.environ.get("BMS_EMAIL_SMTP_PORT", 587)), help="SMTP port (default: 587)")
-    parser.add_argument("--venue-codes", default=os.environ.get("BMS_VENUE_CODES"), help="Comma-separated venue codes for fallback check (e.g. INPR,PVPZ)")
+    parser.add_argument("--venue-codes", default=os.environ.get("BMS_VENUE_CODES"), help="Comma-separated venue codes for fallback/filtering check (e.g. INPR,PVPZ)")
     parser.add_argument("--min-references", type=int, default=int(os.environ.get("BMS_MIN_REFERENCES", 10)), help="Min page references count for fallback bms_date check (default: 10)")
     parser.add_argument("--test-notify", action="store_true", help="Send test notifications and exit")
     parser.add_argument("--install-service", action="store_true", help="Generate and install Systemd user service")
     
     args = parser.parse_args()
     
-    # Process target dates
     args.dates = [d.strip() for d in args.dates.split(",") if re.match(r'^\d{8}$', d.strip())]
     if not args.dates:
         print("Error: No valid target dates provided. Dates must be in YYYYMMDD format.")
         sys.exit(1)
         
-    # Process venue codes
     if args.venue_codes:
-        args.venue_codes = [c.strip() for c in args.venue_codes.split(",") if c.strip()]
+        args.venue_codes = [c.strip().upper() for c in args.venue_codes.split(",") if c.strip()]
         
     if args.install_service:
         install_systemd_service(args)
